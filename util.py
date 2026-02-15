@@ -1,5 +1,7 @@
 """Utilities to make gamefixes easier"""
 
+from __future__ import annotations
+
 import configparser
 import os
 import sys
@@ -27,9 +29,20 @@ from .steamhelper import install_app
 
 try:
     import __main__ as protonmain
+
 except ImportError:
     log.crit('Unable to hook into Proton main script environment')
     exit()
+
+def _get_proton_session():
+    """Return Proton's Session (g_session) if it exists yet.
+
+    ProtonFixes is imported very early in Proton's launcher script, before
+    `g_session` is created. Gamefixes run later, after `g_session` exists,
+    so this helper lets us safely grab it when available.
+    """
+    return getattr(protonmain, 'g_session', None)
+
 
 
 # TypeAliases
@@ -468,20 +481,412 @@ def append_argument(argument: str) -> None:
     log.debug('New commandline: ' + str(sys.argv))
 
 
+def _nonzero(val) -> bool:
+    try:
+        if val is None:
+            return False
+        # Accept bool/int/str; treat '0', 0, False, '' as false
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, (int, float)):
+            return val != 0
+        sval = str(val)
+        return len(sval) > 0 and sval != "0"
+    except Exception:
+        return False
+
+
+# 1:1 mappings from PROTON_* envvars -> compat_config flags
+_ENV_TO_COMPAT = {
+    "PROTON_NO_WM_DECORATION": "nowmdecoration",
+    "PROTON_DXVK_D3D8": "dxvkd3d8",
+    "PROTON_NO_D3D11": "nod3d11",
+    "PROTON_NO_D3D10": "nod3d10",
+    "PROTON_NO_ESYNC": "noesync",
+    "PROTON_NO_FSYNC": "nofsync",
+    "PROTON_NO_NTSYNC": "nontsync",
+    "PROTON_FORCE_LARGE_ADDRESS_AWARE": "forcelgadd",
+    "PROTON_OLD_GL_STRING": "oldglstr",
+    "PROTON_HIDE_NVIDIA_GPU": "hidenvgpu",
+    "PROTON_HIDE_VANGOGH_GPU": "hidevggpu",
+    "PROTON_HIDE_INTEL_GPU": "hideintelgpu",
+    "PROTON_HIDE_APU": "hideapu",
+    "PROTON_SET_GAME_DRIVE": "gamedrive",
+    "PROTON_SET_STEAM_DRIVE": "steamdrive",
+    "PROTON_NO_XIM": "noxim",
+    "PROTON_HEAP_DELAY_FREE": "heapdelayfree",
+    "PROTON_HEAP_ZERO_MEMORY": "heapzeromemory",
+    "PROTON_DISABLE_NVAPI": "disablenvapi",
+    "PROTON_FORCE_NVAPI": "forcenvapi",
+    "PROTON_ENABLE_WAYLAND": "wayland",
+    "PROTON_USE_WAYLAND": "wayland",
+    "PROTON_PREFER_SDL": "sdlinput",
+    "PROTON_USE_SDL": "sdlinput",
+    "PROTON_FSR3_UPGRADE": "fsr3",
+    "PROTON_FSR4_UPGRADE": "fsr4",
+    "PROTON_FSR4_RDNA3_UPGRADE": "fsr4rdna3",
+    "PROTON_FSR4_INDICATOR": "fsr4hud",
+    "PROTON_DLSS_UPGRADE": "dlss",
+    "PROTON_DLSS_INDICATOR": "dlsshud",
+    "PROTON_XESS_UPGRADE": "xess",
+    "PROTON_NATIVE_AGS": "nativeags",
+    "PROTON_ENABLE_HDR": "hdr",
+    "PROTON_USE_HDR": "hdr",
+    "PROTON_USE_WRITECOPY": "writecopy",
+}
+
+# Special precedence: Proton checks PROTON_USE_WINED3D first; only if it's absent does it consult PROTON_USE_WINED3D11.
+# We'll emulate that behavior when either of these is set.
+_WINED3D_CHAIN = ("PROTON_USE_WINED3D", "PROTON_USE_WINED3D11")
+_WINED3D_FLAG = "wined3d"
+
+# Flags that are controlled by multiple envvars, in Proton check order
+_FLAG_ENV_ORDER = {
+    "wayland": ("PROTON_ENABLE_WAYLAND", "PROTON_USE_WAYLAND"),
+    "sdlinput": ("PROTON_PREFER_SDL", "PROTON_USE_SDL"),
+    "hdr": ("PROTON_ENABLE_HDR", "PROTON_USE_HDR"),
+}
+
+# ---- Tracking so del_environment can revert safely ----
+_COMPAT_FLAG_BASELINE: dict[str, bool] = {}     # flag -> original presence at first touch
+_ENVVAR_TO_FLAGS_TOUCHED: dict[str, set[str]] = {}  # envvar -> flags it affects (for cleanup)
+_ADD_CONFIG_TOKENS_BY_ENVVAR: dict[str, set[str]] = {}  # PROTON_ADD_CONFIG tokens we added
+
+
+def _set_or_unset(env: dict, key: str, enable: bool, enable_value: str = "1") -> None:
+    """Set env[key]=enable_value when enable else remove key."""
+    if enable:
+        env[key] = enable_value
+    else:
+        env.pop(key, None)
+
+
+
+_WINE_DLL_BASELINE: dict[str, Optional[str]] = {}
+
+def _parse_winedlloverrides(value: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not value:
+        return out
+    for part in value.split(";"):
+        if not part or "=" not in part:
+            continue
+        dll, setting = part.split("=", 1)
+        dll = dll.strip()
+        if dll:
+            out[dll] = setting
+    return out
+
+def _serialize_winedlloverrides(mapping: dict[str, str]) -> str:
+    return ";".join([f"{k}={v}" for k, v in mapping.items()])
+
+def _update_winedlloverrides(env: dict, updates: dict[str, Optional[str]]) -> None:
+    cur = _parse_winedlloverrides(env.get("WINEDLLOVERRIDES", ""))
+    for dll, new_setting in updates.items():
+        if dll not in _WINE_DLL_BASELINE:
+            _WINE_DLL_BASELINE[dll] = cur.get(dll)
+        if new_setting is None:
+            cur.pop(dll, None)
+        else:
+            cur[dll] = new_setting
+    env["WINEDLLOVERRIDES"] = _serialize_winedlloverrides(cur)
+
+def _restore_winedlloverrides(env: dict, dlls: list[str]) -> None:
+    cur = _parse_winedlloverrides(env.get("WINEDLLOVERRIDES", ""))
+    for dll in dlls:
+        if dll not in _WINE_DLL_BASELINE:
+            continue
+        baseline = _WINE_DLL_BASELINE[dll]
+        if baseline is None:
+            cur.pop(dll, None)
+        else:
+            cur[dll] = baseline
+    env["WINEDLLOVERRIDES"] = _serialize_winedlloverrides(cur)
+
+def _guess_xlocaledir() -> str:
+    try:
+        proton = getattr(__import__("__main__"), "g_proton", None)
+        dist_dir = getattr(proton, "dist_dir", None)
+        if dist_dir:
+            return dist_dir + "share/X11/locale"
+    except Exception:
+        pass
+    return ""
+
+
+def _apply_proton_knob_side_effects(changed_envvar):
+    """Mirror Proton's init_session() side effects for envvars changed by ProtonFixes.
+
+    Proton reads many PROTON_* envvars inside Session.init_session(). ProtonFixes
+    runs *after* init_session(), so when a gamefix changes a PROTON_* knob we
+    replicate the meaningful changes here (compat_config updates + derived WINE_*
+    envvars that Proton would normally set later).
+    """
+    sess = _get_proton_session()
+    if sess is None:
+        return
+    enabled = _nonzero(sess.env.get(changed_envvar))
+
+
+    def _set_or_clear_env(key, value="1"):
+        _set_or_unset(sess.env, key, enabled, value=value)
+
+    # --- Sync / futex knobs ---
+    if changed_envvar == "PROTON_NO_NTSYNC":
+        if enabled:
+            sess.compat_config.add("nontsync")
+            sess.env.pop("WINENTSYNC", None)
+        else:
+            sess.compat_config.discard("nontsync")
+            sess.env["WINENTSYNC"] = "1"
+        return
+
+    if changed_envvar == "PROTON_NO_ESYNC":
+        if enabled:
+            sess.compat_config.add("noesync")
+            sess.env.pop("WINEESYNC", None)
+        else:
+            sess.compat_config.discard("noesync")
+            sess.env["WINEESYNC"] = "1"
+        return
+
+    if changed_envvar == "PROTON_NO_FSYNC":
+        if enabled:
+            sess.compat_config.add("nofsync")
+            sess.env.pop("WINEFSYNC", None)
+        else:
+            sess.compat_config.discard("nofsync")
+            sess.env["WINEFSYNC"] = "1"
+        return
+
+    # --- Heap knobs ---
+    if changed_envvar == "PROTON_HEAP_DELAY_FREE":
+        if enabled:
+            sess.compat_config.add("heapdelayfree")
+        else:
+            sess.compat_config.discard("heapdelayfree")
+        _set_or_clear_env("WINE_HEAP_DELAY_FREE")
+        return
+
+    if changed_envvar == "PROTON_HEAP_ZERO_MEMORY":
+        if enabled:
+            sess.compat_config.add("heapzeromemory")
+        else:
+            sess.compat_config.discard("heapzeromemory")
+        _set_or_clear_env("WINE_HEAP_ZERO_MEMORY")
+        return
+
+    # --- Drive mount knobs (need compat_config for Proton's later setup_*_drive calls) ---
+    if changed_envvar == "PROTON_SET_GAME_DRIVE":
+        if enabled:
+            sess.compat_config.add("gamedrive")
+        else:
+            sess.compat_config.discard("gamedrive")
+        return
+
+    if changed_envvar == "PROTON_SET_STEAM_DRIVE":
+        if enabled:
+            sess.compat_config.add("steamdrive")
+        else:
+            sess.compat_config.discard("steamdrive")
+        return
+
+    # --- GPU hiding knobs ---
+    if changed_envvar == "PROTON_HIDE_NVIDIA_GPU":
+        if enabled:
+            sess.compat_config.add("hidenvgpu")
+        else:
+            sess.compat_config.discard("hidenvgpu")
+
+        # Proton only applies this when not forcing NVAPI
+        if enabled and "forcenvapi" not in sess.compat_config:
+            sess.env["WINE_HIDE_NVIDIA_GPU"] = "1"
+        else:
+            sess.env.pop("WINE_HIDE_NVIDIA_GPU", None)
+        return
+
+    if changed_envvar == "PROTON_HIDE_VANGOGH_GPU":
+        if enabled:
+            sess.compat_config.add("hidevggpu")
+        else:
+            sess.compat_config.discard("hidevggpu")
+        _set_or_clear_env("WINE_HIDE_VANGOGH_GPU")
+        return
+
+    if changed_envvar == "PROTON_HIDE_INTEL_GPU":
+        if enabled:
+            sess.compat_config.add("hideintelgpu")
+        else:
+            sess.compat_config.discard("hideintelgpu")
+        _set_or_clear_env("WINE_HIDE_INTEL_GPU")
+        return
+
+    if changed_envvar == "PROTON_HIDE_APU":
+        if enabled:
+            sess.compat_config.add("hideapu")
+        else:
+            sess.compat_config.discard("hideapu")
+        _set_or_clear_env("WINE_HIDE_APU")
+        return
+def _apply_proton_session_actions(changed_envvar):
+    """Run Proton helper actions that depend on compat_config after a knob change.
+
+    Some settings are acted on by helper functions in the Proton launcher (for
+    example the drive mount symlinks). In stock Proton these are typically
+    called later in the launcher, but custom launch flows might not, so we try
+    to trigger them opportunistically.
+    """
+    sess = _get_proton_session()
+    if sess is None:
+        return
+
+    try:
+        if changed_envvar == "PROTON_SET_GAME_DRIVE" and hasattr(protonmain, "setup_game_dir_drive"):
+            protonmain.setup_game_dir_drive()
+        elif changed_envvar == "PROTON_SET_STEAM_DRIVE" and hasattr(protonmain, "setup_steam_dir_drive"):
+            protonmain.setup_steam_dir_drive()
+    except Exception:
+        # Best-effort only; the main launcher will also attempt these later.
+        return
+def _apply_env_to_compat_config(changed_envvar: str) -> None:
+    """
+    Update compat_config based on a just-set envvar, following Proton check_environment semantics:
+    - if envvar is present: nonzero => add flag, zero/empty => discard flag
+    - if envvar is absent: do nothing (not possible here since we just set it)
+    """
+    env = protonmain.g_session.env
+    cfg = protonmain.g_session.compat_config
+
+    # Special precedence chain for wined3d knobs
+    if changed_envvar in _WINED3D_CHAIN:
+        # Emulate: if PROTON_USE_WINED3D exists, it decides. Else if PROTON_USE_WINED3D11 exists, it decides.
+        if _WINED3D_CHAIN[0] in env:
+            if _nonzero(env[_WINED3D_CHAIN[0]]):
+                cfg.add(_WINED3D_FLAG)
+            else:
+                cfg.discard(_WINED3D_FLAG)
+        elif _WINED3D_CHAIN[1] in env:
+            if _nonzero(env[_WINED3D_CHAIN[1]]):
+                cfg.add(_WINED3D_FLAG)
+            else:
+                cfg.discard(_WINED3D_FLAG)
+        return
+
+    flag = _ENV_TO_COMPAT.get(changed_envvar)
+    if not flag:
+        return
+
+    if _nonzero(env.get(changed_envvar, "")):
+        cfg.add(flag)
+    else:
+        cfg.discard(flag)
+
+
 def set_environment(envvar: str, value: str) -> None:
-    """Add or override an environment value"""
+    """Add or override an environment value.
+
+    Extended behavior:
+    - If envvar is a PROTON_* knob that Proton normally translates into compat_config flags,
+      update protonmain.g_session.compat_config immediately.
+    - Apply a small set of important late-binding side effects (esync/fsync/ntsync, hdr, etc.)
+      so that user protonfix scripts behave as expected even though init_session() already ran.
+    """
     log.info(f'Adding env: {envvar}={value}')
+
+    # Set in both the process env (os.environ) and Proton’s session env used for launching.
     os.environ[envvar] = value
     protonmain.g_session.env[envvar] = value
 
+    # Record baseline compat state for any flag this envvar can affect
+    flags = set()
+    if envvar in _WINED3D_CHAIN:
+        flags.add(_WINED3D_FLAG)
+    elif envvar in _ENV_TO_COMPAT:
+        flags.add(_ENV_TO_COMPAT[envvar])
 
-def del_environment(envvar: str) -> None:
-    """Remove an environment variable"""
+
+    if flags:
+        for f in flags:
+            _COMPAT_FLAG_BASELINE.setdefault(f, f in protonmain.g_session.compat_config)
+        _ENVVAR_TO_FLAGS_TOUCHED.setdefault(envvar, set()).update(flags)
+
+    # Update compat_config if this is a known knob
+    _apply_env_to_compat_config(envvar)
+
+    # Apply common derived effects for late setting
+    _apply_proton_knob_side_effects(envvar)
+
+    # Run any session setup that Proton would normally do based on compat_config
+    _apply_proton_session_actions(envvar)
+
+
+def _recompute_flag_from_env(flag: str) -> Optional[bool]:
+    env = protonmain.g_session.env
+
+    if flag == _WINED3D_FLAG:
+        if _WINED3D_CHAIN[0] in env:
+            return _nonzero(env.get(_WINED3D_CHAIN[0], ""))
+        if _WINED3D_CHAIN[1] in env:
+            return _nonzero(env.get(_WINED3D_CHAIN[1], ""))
+        return None
+
+    # If this flag has ordered aliases, use Proton's order and let the last present envvar win
+    if flag in _FLAG_ENV_ORDER:
+        winner = None
+        for k in _FLAG_ENV_ORDER[flag]:
+            if k in env:
+                winner = k
+        if winner is None:
+            return None
+        return _nonzero(env.get(winner, ""))
+
+    # Single envvar case (or “multiple” but not special-cased): find envvars that map to flag
+    controlling = [k for k, v in _ENV_TO_COMPAT.items() if v == flag and k in env]
+    if not controlling:
+        return None
+
+    # If multiple remain here, pick a deterministic winner: last in lexical order (or keep as-is).
+    # Better: add them to _FLAG_ENV_ORDER.
+    winner = sorted(controlling)[-1]
+    return _nonzero(env.get(winner, ""))
+
+    """Remove an environment variable, and undo its Proton knob effects (compat_config + key side-effects)."""
     log.info('Removing env: ' + envvar)
-    if envvar in os.environ:
-        del os.environ[envvar]
-    if envvar in protonmain.g_session.env:
-        del protonmain.g_session.env[envvar]
+
+    # Remove from both process and Proton's launch env
+    os.environ.pop(envvar, None)
+    protonmain.g_session.env.pop(envvar, None)
+
+    env = protonmain.g_session.env
+    cfg = protonmain.g_session.compat_config
+
+    # If we previously used this envvar to touch compat flags, try to revert safely
+    flags_touched = _ENVVAR_TO_FLAGS_TOUCHED.get(envvar, set())
+
+    for flag in flags_touched:
+        decided = _recompute_flag_from_env(flag)
+        if decided is None:
+            # No envvar currently controls it -> revert to baseline (or leave as-is if unknown)
+            baseline = _COMPAT_FLAG_BASELINE.get(flag, (flag in cfg))
+            if baseline:
+                cfg.add(flag)
+            else:
+                cfg.discard(flag)
+        else:
+            # Env still controls it via another envvar -> follow env decision
+            if decided:
+                cfg.add(flag)
+            else:
+                cfg.discard(flag)
+
+
+    # Re-apply important derived env side-effects after compat_config may have changed
+    # (ESYNC/FSYNC/NTSYNC, HDR, etc.)
+    _apply_proton_knob_side_effects(envvar)
+
+    # Run any session setup that Proton would normally do based on compat_config
+    _apply_proton_session_actions(envvar)
+
 
 
 def get_game_install_path() -> str:
